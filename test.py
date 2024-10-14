@@ -29,6 +29,7 @@ MIN_TRADE_AMOUNT = 5000
 ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY")
 SANTIMENT_API_KEY = os.getenv("SANTIMENT_API_KEY")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
+api_key = os.getenv('OPENAI_API_KEY')
 
 def get_chart_data(symbol=TRADING_PAIR, count=30, interval="day"):
     df = pyupbit.get_ohlcv(symbol, count=count, interval=interval)

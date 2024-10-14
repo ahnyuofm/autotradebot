@@ -19,8 +19,10 @@ ETHERSCAN_API_URL = "https://api.etherscan.io/api"
 SANTIMENT_API_URL = "https://api.santiment.net/graphql"
 NEWS_API_URL = "https://newsapi.org/v2/everything"
 COINGECKO_API_URL = "https://api.coingecko.com/api/v3/simple/price"
-ETHERSCAN_API_KEY="DV4DSGT7WP2BQFXBN3A5QKKV1TFF872Q6H"
-SANTIMENT_API_KEY="mfcx2jalhoeta7dy_5otywe35xeccbpth"
+EETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY")
+SANTIMENT_API_KEY = os.getenv("SANTIMENT_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
 # Time intervals
 TRADING_INTERVAL = 3600  # 1 hour in seconds
 CHART_DATA_INTERVAL = "day"
