@@ -4,20 +4,32 @@ import requests
 import pyupbit
 import pandas as pd
 import ta
+from ta.utils import dropna
+from ta.trend import SMAIndicator, EMAIndicator, MACD
+from ta.momentum import RSIIndicator
+from ta.volatility import BollingerBands
 from newsapi import NewsApiClient
 from datetime import datetime, timedelta
 import time
 from dotenv import load_dotenv
 from openai import OpenAI
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.by import By
+import base64
+import traceback
+import sqlite3
+
 from config import (
     TRADING_PAIR,
     TRADE_FRACTION,
     MIN_TRADE_AMOUNT,
-    STOP_LOSS_PERCENTAGE,
-    MAX_DAILY_LOSS_PERCENTAGE,
     POSITION_SIZE_PERCENTAGE
 )
-
+# Load environment variables and configurations
 load_dotenv()
 
 # Configuration
@@ -29,290 +41,386 @@ MIN_TRADE_AMOUNT = 5000
 ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY")
 SANTIMENT_API_KEY = os.getenv("SANTIMENT_API_KEY")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
-api_key = os.getenv('OPENAI_API_KEY')
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 
-def get_chart_data(symbol=TRADING_PAIR, count=30, interval="day"):
-    df = pyupbit.get_ohlcv(symbol, count=count, interval=interval)
-    
-    # Add technical indicators
-    df['RSI'] = ta.momentum.RSIIndicator(df['close']).rsi()
-    df['MACD'] = ta.trend.MACD(df['close']).macd()
-    df['MACD_Signal'] = ta.trend.MACD(df['close']).macd_signal()
-    df['BB_High'] = ta.volatility.BollingerBands(df['close']).bollinger_hband()
-    df['BB_Low'] = ta.volatility.BollingerBands(df['close']).bollinger_lband()
-    
-    return df
+def setup_database():
+    conn = sqlite3.connect('trade_history.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS trades
+                 (timestamp TEXT,
+                  decision TEXT,
+                  percentage REAL,
+                  reason TEXT,
+                  ETH_balance REAL,
+                  krw_balance REAL,
+                  eth_average_buy_price REAL,
+                  eth_krw_price REAL)''')
+    conn.commit()
+    conn.close()
 
-#def get_eth_gas_price():
-    url = f"https://api.etherscan.io/api?module=gastracker&action=gasoracle&apikey={ETHERSCAN_API_KEY}"
+def record_trade(decision, percentage, reason):
+    conn = sqlite3.connect('trade_history.db')
+    c = conn.cursor()
+    timestamp = datetime.now().isoformat()
+    ETH_balance = upbit.get_balance("KRW-ETH")
+    krw_balance = upbit.get_balance("KRW")
+    eth_average_buy_price = upbit.get_avg_buy_price("KRW-ETH")
+    eth_krw_price = pyupbit.get_current_price("KRW-ETH")
     
-    try:
-        response = requests.get(url)
-        
-        # Check if response is valid (status code 200)
-        if response.status_code != 200:
-            raise ValueError(f"Failed to fetch data from API. Status Code: {response.status_code}")
-        
-        data = response.json()
-        
-        # Check if the 'result' key is present in the response
-       # In get_eth_custom_index(), handle when data is None
-        if gas_price is None or social_sentiment is None:
-            print("Error: Gas price or sentiment data missing. Cannot calculate index.")
-            return None
+    c.execute("INSERT INTO trades (timestamp, decision, percentage, reason, ETH_balance, krw_balance, eth_average_buy_price, eth_krw_price) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+              (timestamp, decision, percentage, reason, ETH_balance, krw_balance, eth_average_buy_price, eth_krw_price))
+    conn.commit()
+    conn.close()
 
-        
-        # Check if 'SafeGasPrice' is in the 'result' and convert it to a number
-        safe_gas_price = data['result'].get('SafeGasPrice', None)
-        if safe_gas_price is None:
-            raise ValueError(f"'SafeGasPrice' is missing in the response. Full response: {data['result']}")
-        
-        # Convert 'SafeGasPrice' to float then to int (in case it's a float string)
-        return int(float(safe_gas_price))
-    
-    except requests.exceptions.RequestException as e:
-        print(f"Request error: {e}")
-    except ValueError as e:
-        print(f"Value error: {e}")
-    except Exception as e:
-        print(f"Unexpected error: {e}")
-    
-    # Return None if an error occurs
-    return None
+def get_trade_history(limit=10):
+    conn = sqlite3.connect('trade_history.db')
+    c = conn.cursor()
+    c.execute("SELECT * FROM trades ORDER BY timestamp DESC LIMIT ?", (limit,))
+    trades = c.fetchall()
+    conn.close()
+    return trades
 
-#def get_eth_social_sentiment():
-    url = "https://api.santiment.net/graphql"
-    query = """
-    {
-      getMetric(metric: "sentiment_volume_consumed_total") {
-        timeseriesData(
-          slug: "ethereum"
-          from: "2023-10-10T00:00:00Z"
-          to: "2024-09-09T23:59:59Z"
-          interval: "1d"
-        ) {
-          value
-        }
-      }
+def get_chart_data(symbol=TRADING_PAIR):
+    def add_indicators(df):
+        df = dropna(df)
+        df['SMA_20'] = SMAIndicator(close=df['close'], window=20).sma_indicator()
+        df['EMA_12'] = EMAIndicator(close=df['close'], window=12).ema_indicator()
+        macd = MACD(close=df['close'])
+        df['MACD'] = macd.macd()
+        df['MACD_Signal'] = macd.macd_signal()
+        df['MACD_Hist'] = macd.macd_diff()
+        df['RSI'] = RSIIndicator(close=df['close']).rsi()
+        bollinger = BollingerBands(close=df['close'])
+        df['BB_High'] = bollinger.bollinger_hband()
+        df['BB_Low'] = bollinger.bollinger_lband()
+        df['BB_Mid'] = bollinger.bollinger_mavg()
+        return df
+
+    df_30d = pyupbit.get_ohlcv(symbol, interval="day", count=30)
+    df_24h = pyupbit.get_ohlcv(symbol, interval="minute60", count=24)
+    
+    df_30d = add_indicators(df_30d)
+    df_24h = add_indicators(df_24h)
+    
+    return {
+        '30d': df_30d,
+        '24h': df_24h
     }
-    """
-    headers = {"Authorization": f"Bearer {SANTIMENT_API_KEY}"}
-    try:
-        response = requests.post(url, json={"query": query}, headers=headers)
-        data = response.json()
-        
-        if 'data' in data and 'getMetric' in data['data'] and 'timeseriesData' in data['data']['getMetric']:
-            sentiment_values = data['data']['getMetric']['timeseriesData']
-            if sentiment_values:
-                return sentiment_values[-1]['value']  # Get the last value in the timeseries
-        else:
-            print(f"Error: Invalid response structure: {data}")
-        
-        return None
-    except Exception as e:
-        print(f"Error in get_eth_social_sentiment: {str(e)}")
-        return None
 
-
-#def get_eth_custom_index():
+def get_fear_and_greed_index(limit=7):
+    url = f"https://api.alternative.me/fng/?limit={limit}"
     try:
-        url = "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd&include_24hr_change=true"
         response = requests.get(url)
+        response.raise_for_status()
         data = response.json()
-        price_change = data['ethereum']['usd_24h_change']
-
-        gas_price = get_eth_gas_price()
-        social_sentiment = get_eth_social_sentiment()
-
-        if gas_price is None or social_sentiment is None:
-            print("Error: Gas price or sentiment data missing. Cannot calculate index.")
-            return None
-
-        custom_index = (
-            price_change * 0.4 +
-            gas_price * 0.3 +
-            social_sentiment * 0.3
-        )
-
-        return max(0, min(custom_index, 100))
-    except Exception as e:
-        print(f"Error in get_eth_custom_index: {str(e)}")
+        fng_data = [
+            {
+                'value': int(item['value']),
+                'classification': item['value_classification'],
+                'timestamp': datetime.fromtimestamp(int(item['timestamp']))
+            }
+            for item in data['data']
+        ]
+        return fng_data
+    except requests.RequestException as e:
+        print(f"Error fetching Fear and Greed Index: {e}")
         return None
-
-from newsapi import NewsApiClient
-
-# Make sure NEWS_API_KEY is set in your environment variables or .env file
-NEWS_API_KEY = os.getenv('NEWS_API_KEY')
 
 def get_eth_news():
     try:
-        # Initialize the client
         newsapi = NewsApiClient(api_key=NEWS_API_KEY)
-
-        # Fetch Ethereum-related news
         all_articles = newsapi.get_everything(q='ethereum',
                                               language='en',
                                               sort_by='publishedAt',
                                               page_size=5)
-
-        # Process the articles
         if all_articles['status'] == 'ok':
             articles = all_articles['articles']
             return [{"title": article["title"], "description": article["description"]} for article in articles]
         else:
             print(f"Error in API response: {all_articles['status']}")
             return []
-
     except Exception as e:
         print(f"Error fetching news: {str(e)}")
         return []
 
-def get_ai_decision(df, news):
+def take_upbit_eth_screenshot():
+    chrome_options = Options()
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--window-size=1920,1080")
+    
+    service = Service()
+    driver = webdriver.Chrome(service=service, options=chrome_options)
+
+    screenshot_path = ""
     try:
-        client = OpenAI()
-        news_text = "\n".join([f"Title: {article['title']}\nDescription: {article['description']}" for article in news])
+        driver.get("https://upbit.com/exchange?code=CRIX.UPBIT.KRW-ETH")
+        WebDriverWait(driver, 30).until(
+            EC.presence_of_element_located((By.ID, "exchangeChartiq"))
+        )
+        time.sleep(5)
+        screenshot_path = os.path.join(os.getcwd(), "upbit_eth_krw_chart.png")
+        driver.save_screenshot(screenshot_path)
+        print(f"Screenshot saved to: {screenshot_path}")
+    except Exception as e:
+        print(f"An error occurred during screenshot: {e}")
+        driver.save_screenshot("error_state.png")
+        print("Error state screenshot saved as error_state.png")
+    finally:
+        driver.quit()
+    return screenshot_path
+
+def encode_image(image_path):
+    with open(image_path, "rb") as image_file:
+        return base64.b64encode(image_file.read()).decode('utf-8')
+
+def analyze_screenshot(image_path):
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    base64_image = encode_image(image_path)
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {
+                "role": "system",
+                "content": "You are an AI assistant specialized in analyzing cryptocurrency trading charts. Focus on identifying trends, patterns, and potential trading signals in the Ethereum/KRW chart."
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Analyze this Ethereum/KRW chart from Upbit. Provide insights on the current trend, any notable patterns, and potential trading signals. Be concise and focus on actionable information for trading decisions."
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{base64_image}"
+                        }
+                    }
+                ]
+            }
+        ],
+        max_tokens=300
+    )
+    return response.choices[0].message.content
+
+import json
+import pandas as pd
+
+import json
+import re
+from openai import OpenAI
+from typing import Dict, Any, Union, List
+import logging
+import pandas as pd
+from pandas import Timestamp
+
+logger = logging.getLogger(__name__)
+
+def convert_to_serializable(data: Any) -> Any:
+    """Convert input data to a JSON-serializable format."""
+    if isinstance(data, pd.DataFrame):
+        return data.to_dict(orient='records')
+    elif isinstance(data, (list, tuple)):
+        return [convert_to_serializable(item) for item in data]
+    elif isinstance(data, dict):
+        return {str(k): convert_to_serializable(v) for k, v in data.items()}
+    elif isinstance(data, Timestamp):
+        return data.isoformat()
+    elif pd.isna(data):
+        return None
+    else:
+        return data
+
+def extract_decision_from_text(text: str) -> Dict[str, Any]:
+    """Extract decision information from text if JSON parsing fails."""
+    decision = re.search(r'\b(buy|sell|hold)\b', text.lower())
+    decision = decision.group() if decision else "hold"
+    
+    confidence_match = re.search(r'confidence[:\s]+(\d+(?:\.\d+)?)', text, re.IGNORECASE)
+    confidence = float(confidence_match.group(1)) if confidence_match else 0
+    
+    return {
+        "decision": decision,
+        "reason": text[:500] + "..." if len(text) > 500 else text,  # Truncate long texts
+        "confidence": confidence,
+        "analysis": {
+            "market_trend": "Extracted from non-JSON response",
+            "news_sentiment": "Extracted from non-JSON response",
+            "technical_indicators": "Extracted from non-JSON response"
+        }
+    }
+
+def get_ai_decision(market_data: Union[pd.DataFrame, List, Dict], 
+                    news_data: Union[pd.DataFrame, List, Dict], 
+                    screenshot_analysis: str) -> Dict[str, Any]:
+    """Get trading decision from AI based on provided data."""
+    try:
+        client = OpenAI(api_key=OPENAI_API_KEY)
         
-        df_dict = df.reset_index().to_dict(orient='records')
-       
+        # Convert inputs to serializable format
+        market_data_serializable = convert_to_serializable(market_data)
+        news_data_serializable = convert_to_serializable(news_data)
+        
+        # Prepare the data for the AI
+        serializable_data = {
+            "market_data": market_data_serializable,
+            "news_data": news_data_serializable,
+            "screenshot_analysis": screenshot_analysis
+        }
+        
         response = client.chat.completions.create(
             model="gpt-4o", 
             messages=[
                 {
-                "role": "system",
-                "content": """You are an Ethereum Trading expert. Analyze the provided json data and decide whether to buy, sell, or hold based on the information provided. Consider the technical indicators and the Ethereum Sentiment Index in your decision.
-
-Your response must be a JSON object with the following structure:
-{
-    "decision": "buy|sell|hold",
-    "reason": "A brief explanation of your decision"
-}"""
+                    "role": "system",
+                    "content": "You are an Ethereum Trading expert. Analyze the provided json data and decide whether to buy, sell, or hold Ethereum. Consider the market data, news sentiment, and screenshot analysis in your decision. Provide your decision along with a confidence level (0-1) and detailed analysis. Your response must be in valid JSON format."
                 },
                 {
-                 "role": "user",
-                "content": json.dumps({
-                    "market_data": df_dict,
-                    #"eth_sentiment_index": eth_sentiment_index,
-                    "recent_news": news_text
-                }, default=str)
-                },
+                    "role": "user",
+                    "content": json.dumps(serializable_data, default=str)
+                }
             ],
+            temperature=0.7,
+            max_tokens=2048,
+            top_p=1,
+            frequency_penalty=0,
+            presence_penalty=0,
             response_format={"type": "json_object"}
         )
-        decision_data = json.loads(response.choices[0].message.content)
         
-        print(f"AI Response: {decision_data}")
+        # Extract and parse the AI's response
+        print("Raw AI response:", response.choices[0].message.content)
+        ai_response = response.choices[0].message.content
+        logger.info(f"AI response: {ai_response}")
         
-        if 'decision' not in decision_data or 'reason' not in decision_data:
-            raise ValueError(f"AI response is missing 'decision' or 'reason'. Full response: {decision_data}")
+        try:
+            decision_data = json.loads(ai_response)
+            return decision_data
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse AI response as JSON: {e}")
+            logger.info("Attempting to extract decision from text response")
+            return extract_decision_from_text(ai_response)
         
-        return decision_data
     except Exception as e:
-        print(f"Error in get_ai_decision: {str(e)}")
-        return {"decision": "hold", "reason": "Error in AI decision-making process"}
-
-
-
-def calculate_daily_pnl(upbit):
-    try:
-        balances = upbit.get_balances()
-        total_value = sum(float(balance['balance']) * float(balance['avg_buy_price']) for balance in balances if 'balance' in balance and 'avg_buy_price' in balance)
-        initial_balance = float(os.getenv("INITIAL_BALANCE", str(total_value)))
-        return (total_value - initial_balance) / initial_balance
-    except Exception as e:
-        print(f"Error in calculate_daily_pnl: {str(e)}")
-        return 0
-
-def execute_trade(upbit, decision, reason):
+        logger.error(f"Error in get_ai_decision: {str(e)}")
+        return {
+            "decision": "hold",
+            "reason": f"Error in AI decision-making process: {str(e)}",
+            "confidence": 0,
+            "analysis": {
+                "market_trend": "Error occurred",
+                "news_sentiment": "Error occurred",
+                "technical_indicators": "Error occurred"
+            }
+        }
+        
+def execute_trade(upbit, percentage, reason):
     try:
         current_price = pyupbit.get_current_price(TRADING_PAIR)
-        account_balance = upbit.get_balance("KRW")
         
-        # Check daily loss limit
-        daily_pnl = calculate_daily_pnl(upbit)
-        if daily_pnl < -MAX_DAILY_LOSS_PERCENTAGE:
-            print(f"Daily loss limit reached: {daily_pnl:.2%}. Skipping trade.")
-            return
-
-        if decision == "buy":
-            # Position sizing
-            trade_amount = min(account_balance * POSITION_SIZE_PERCENTAGE, account_balance * 0.9995)
+        if percentage > 0:  # Buy
+            account_balance = upbit.get_balance("KRW")
+            trade_amount = min(account_balance * (percentage / 100), account_balance * 0.9995)
             if trade_amount > MIN_TRADE_AMOUNT:
                 order = upbit.buy_market_order(TRADING_PAIR, trade_amount)
                 print(f"Buy order executed: {order}")
                 print(f"Buy reason: {reason}")
-                
-                # Set stop loss order
-                stop_loss_price = current_price * (1 - STOP_LOSS_PERCENTAGE)
-                eth_balance = upbit.get_balance(TRADING_PAIR)
-                upbit.sell_limit_order(TRADING_PAIR, stop_loss_price, eth_balance)
-                print(f"Stop loss order set at {stop_loss_price}")
             else:
                 print(f"Buy failed: Trade amount ({trade_amount:.2f} KRW) is below minimum ({MIN_TRADE_AMOUNT} KRW)")
-        
-        elif decision == "sell":
+
+        elif percentage < 0:  # Sell
             eth_balance = upbit.get_balance(TRADING_PAIR)
-            trade_amount = eth_balance * TRADE_FRACTION
+            trade_amount = eth_balance * (abs(percentage) / 100)
             if trade_amount * current_price > MIN_TRADE_AMOUNT:
                 order = upbit.sell_market_order(TRADING_PAIR, trade_amount)
                 print(f"Sell order executed: {order}")
                 print(f"Sell reason: {reason}")
             else:
                 print(f"Sell failed: Trade amount ({trade_amount * current_price:.2f} KRW) is below minimum ({MIN_TRADE_AMOUNT} KRW)")
-        
-        elif decision == "hold":
+
+        else:  # Hold
             print(f"Holding. Reason: {reason}")
 
     except Exception as e:
         print(f"Error in execute_trade: {str(e)}")
 
-# Make sure to call this function in your main trading loop
-def cancel_all_orders(upbit):
-    orders = upbit.get_order(TRADING_PAIR)
-    for order in orders:
-        upbit.cancel_order(order['uuid'])
-    print("All existing orders cancelled.")
-
-# Update your main trading loop to include this:
-
-def cancel_all_orders(upbit):
-    try:
-        orders = upbit.get_order(TRADING_PAIR)
-        for order in orders:
-            upbit.cancel_order(order['uuid'])
-        print("All existing orders cancelled.")
-    except Exception as e:
-        print(f"Error in cancel_all_orders: {str(e)}")
 
 def ai_trading():
     try:
-        df = get_chart_data()
-        news = get_eth_news()
-
-        print("Recent price data and indicators:")
-        print(df.tail())
+        print(f"\nStarting AI trading cycle at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}...")
         
+        # Get chart data
+        df = get_chart_data()
+        if '30d' not in df:
+            raise ValueError("Expected '30d' key in chart data not found")
+        print("Chart data retrieved successfully.")
+        
+        # Get news
+        news = get_eth_news()
         if news:
-            print("Recent Ethereum News Headlines:")
-            for article in news:
-                print(f"- {article['title']}")
+            print(f"Retrieved {len(news)} news articles.")
         else:
             print("No recent news available.")
-
-        result = get_ai_decision(df, news)
         
+        # Take and analyze screenshot
+        screenshot_path = take_upbit_eth_screenshot()
+        if screenshot_path and os.path.exists(screenshot_path):
+            screenshot_analysis = analyze_screenshot(screenshot_path)
+            print("Screenshot captured and analyzed successfully.")
+        else:
+            screenshot_analysis = "Failed to capture or analyze the screenshot."
+            print("Warning: " + screenshot_analysis)
+
+        # Print detailed information
+        print("\nRecent price data and indicators (last 5 rows):")
+        print(df['30d'].tail().to_string())
+        
+        if news:
+            print("\nRecent Ethereum News Headlines:")
+            for i, article in enumerate(news, 1):
+                print(f"{i}. {article['title']}")
+        
+        print("\nScreenshot Analysis:")
+        print(screenshot_analysis)
+
+        # Get AI decision
+        print("\nRequesting AI decision...")
+        result = get_ai_decision(df['30d'], news, screenshot_analysis)
+        
+        # Validate and print AI decision
+        if not isinstance(result, dict):
+            raise ValueError(f"Expected dict from get_ai_decision, got {type(result)}")
+        
+        percentage = result.get('percentage', 0)
+        reason = result.get('reason', 'No reason provided')
+        confidence = result.get('confidence', 0)
+        
+        print(f"\nAI Decision Percentage: {percentage}%")
+        print(f"Confidence: {confidence}")
+        print(f"Reason: {reason}")
+
+        # Execute trade
+        print("\nExecuting trade...")
         upbit = pyupbit.Upbit(os.getenv("UPBIT_ACCESS_KEY"), os.getenv("UPBIT_SECRET_KEY"))
-        execute_trade(upbit, result["decision"], result["reason"])
+        execute_trade(upbit, percentage, reason)
+
+        print("\nAI trading cycle completed successfully.")
 
     except Exception as e:
-        print(f"An error occurred in ai_trading: {str(e)}")
-
+        print(f"\nAn error occurred in ai_trading: {str(e)}")
+        print("Traceback:")
+        traceback.print_exc()
+    finally:
+        print(f"\nAI trading cycle ended at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 def main():
     print("\nStarting live trading bot...")
+    setup_database()
     while True:
         try:
             ai_trading()
-            time.sleep(3600)
+            time.sleep(3600)  # Run every hour
         except KeyboardInterrupt:
             print("Bot stopped by user. Exiting gracefully...")
             break
