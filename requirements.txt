@@ -3,3 +3,4 @@ openai
 pyupbit
 pandas
 ta
+selenium
