@@ -43,6 +43,66 @@ SANTIMENT_API_KEY = os.getenv("SANTIMENT_API_KEY")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 
+# 로컬용
+# def setup_chrome_options():
+#     chrome_options = Options()
+#     chrome_options.add_argument("--start-maximized")
+#     chrome_options.add_argument("--headless")  # 디버깅을 위해 헤드리스 모드 비활성화
+#     chrome_options.add_argument("--disable-gpu")
+#     chrome_options.add_argument("--no-sandbox")
+#     chrome_options.add_argument("--disable-dev-shm-usage")
+#     chrome_options.add_experimental_option('excludeSwitches', ['enable-logging'])
+#     return chrome_options
+
+# def create_driver():
+#     logger.info("ChromeDriver 설정 중...")
+#     service = Service(ChromeDriverManager().install())
+#     driver = webdriver.Chrome(service=service, options=setup_chrome_options())
+#     return driver
+
+# EC2 서버용
+def create_driver():
+    logger.info("ChromeDriver 설정 중...")
+    try:
+        chrome_options = Options()
+        chrome_options.add_argument("--headless")  # 헤드리스 모드 사용
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--disable-gpu")
+
+        service = Service('/usr/bin/chromedriver')  # Specify the path to the ChromeDriver executable
+
+        # Initialize the WebDriver with the specified options
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+
+        return driver
+    except Exception as e:
+        logger.error(f"ChromeDriver 생성 중 오류 발생: {e}")
+        raise
+
+def click_element_by_xpath(driver, xpath, element_name, wait_time=10):
+    try:
+        element = WebDriverWait(driver, wait_time).until(
+            EC.presence_of_element_located((By.XPATH, xpath))
+        )
+        # 요소가 뷰포트에 보일 때까지 스크롤
+        driver.execute_script("arguments[0].scrollIntoView(true);", element)
+        # 요소가 클릭 가능할 때까지 대기
+        element = WebDriverWait(driver, wait_time).until(
+            EC.element_to_be_clickable((By.XPATH, xpath))
+        )
+        element.click()
+        logger.info(f"{element_name} 클릭 완료")
+        time.sleep(2)  # 클릭 후 잠시 대기
+    except TimeoutException:
+        logger.error(f"{element_name} 요소를 찾는 데 시간이 초과되었습니다.")
+    except ElementClickInterceptedException:
+        logger.error(f"{element_name} 요소를 클릭할 수 없습니다. 다른 요소에 가려져 있을 수 있습니다.")
+    except NoSuchElementException:
+        logger.error(f"{element_name} 요소를 찾을 수 없습니다.")
+    except Exception as e:
+        logger.error(f"{element_name} 클릭 중 오류 발생: {e}")
+
 def setup_database():
     conn = sqlite3.connect('trade_history.db')
     c = conn.cursor()
